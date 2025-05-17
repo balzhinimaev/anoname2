@@ -2,16 +2,14 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import Token from '../models/Token';
 
-// Расширяем интерфейс Request, чтобы добавить пользователя
-declare global {
-  namespace Express {
-    interface Request {
-      user?: {
-        telegramId: string;
-        // Добавьте другие нужные поля
-      };
-      token?: string;
-    }
+// Расширяем интерфейс Request
+declare module 'express' {
+  interface Request {
+    user?: {
+      telegramId: string;
+      // Добавьте другие нужные поля
+    };
+    token?: string;
   }
 }
 
