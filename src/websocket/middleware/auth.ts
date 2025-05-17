@@ -34,12 +34,21 @@ export const socketAuth = async (
       return next(new Error('Authentication error: Token not provided'));
     }
 
-    const decoded = jwt.verify(token, config.jwtSecret) as { userId: string };
-    const user = await User.findById(decoded.userId) as IUser & { _id: mongoose.Types.ObjectId };
+    const decoded = jwt.verify(token, config.jwtSecret) as { userId?: string; telegramId?: string };
+    
+    let user: (IUser & { _id: mongoose.Types.ObjectId }) | null = null;
+    
+    // Пробуем найти пользователя по userId или telegramId
+    if (decoded.userId) {
+      user = await User.findById(decoded.userId) as IUser & { _id: mongoose.Types.ObjectId };
+    } else if (decoded.telegramId) {
+      user = await User.findOne({ telegramId: decoded.telegramId }) as IUser & { _id: mongoose.Types.ObjectId };
+    }
 
     if (!user) {
       wsLogger.error('system', 'socket-auth', new Error('User not found'), {
         userId: decoded.userId,
+        telegramId: decoded.telegramId,
         token: token.substring(0, 10) + '...'
       });
       return next(new Error('Authentication error: User not found'));

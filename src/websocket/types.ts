@@ -15,15 +15,16 @@ export interface ServerToClientEvents {
   'search:status': (data: {
     status: 'searching' | 'cancelled' | 'expired' | 'matched'
   }) => void;
+  'search:stats': (data: {
+    totalSearching: number;
+    genderStats: Record<string, number>;
+  }) => void;
 
   // Чаты и сообщения
   'chat:message': (data: {
     chatId: string;
-    message: {
-      content: string;
-      sender: string;
-      timestamp: Date;
-    };
+    content: string;
+    userId: string;
   }) => void;
   'chat:typing': (data: {
     chatId: string;
@@ -32,7 +33,7 @@ export interface ServerToClientEvents {
   'chat:read': (data: {
     chatId: string;
     userId: string;
-    lastReadTimestamp: Date;
+    timestamp: Date;
   }) => void;
 
   // Контакты
@@ -116,6 +117,6 @@ export interface SocketData {
 export type TypedSocket = Socket<
   ClientToServerEvents,
   ServerToClientEvents,
-  {}, // InterServerEvents - пока не используем
+  Record<string, never>, // InterServerEvents - пока не используем
   SocketData
 >; 

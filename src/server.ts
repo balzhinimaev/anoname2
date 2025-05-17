@@ -5,13 +5,14 @@
 
 import express from 'express';
 import { createServer } from 'http';
-import cors from 'cors';
+// import cors from 'cors';
 import dotenv from 'dotenv';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger';
 import { router as userRouter } from './routes/userRoutes';
 import { router as chatRouter } from './routes/chatRoutes';
 import { router as authRouter } from './routes/authRoutes';
+import { router as searchRouter } from './routes/searchRoutes';
 import { monitoringRouter } from './routes/monitoringRoutes';
 import { authMiddleware } from './middleware/authMiddleware';
 import mongoose from 'mongoose';
@@ -30,12 +31,12 @@ const port = process.env.PORT || 3001;
 /**
  * Настройка CORS для безопасного взаимодействия с клиентом
  */
-app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:3001',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
+// app.use(cors({
+//   origin: process.env.CLIENT_URL || 'http://localhost:3001',
+//   methods: ['GET', 'POST', 'OPTIONS'],
+//   allowedHeaders: ['Content-Type', 'Authorization'],
+//   credentials: true
+// }));
 app.use(express.json());
 
 /**
@@ -67,6 +68,7 @@ app.get('/health', (_req, res) => {
 // Защищенные маршруты (требуют аутентификации)
 app.use('/api/users', authMiddleware, userRouter);
 app.use('/api/chats', authMiddleware, chatRouter);
+app.use('/api/search', searchRouter);
 
 // Error handling middleware
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

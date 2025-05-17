@@ -62,6 +62,9 @@ export class SearchService {
       maxDistance: criteria.maxDistance
     });
 
+    // Отправляем обновленную статистику всем
+    await this.broadcastSearchStats();
+
     // Ищем подходящий мэтч
     const matches = await this.findMatches(search);
     if (matches.length > 0) {
@@ -94,6 +97,9 @@ export class SearchService {
       { status: 'cancelled' },
       { new: true }
     );
+
+    // Отправляем обновленную статистику всем
+    await this.broadcastSearchStats();
 
     return search;
   }
@@ -144,8 +150,8 @@ export class SearchService {
 
   private static selectBestMatch(search: ISearch, matches: ISearch[]): ISearch {
     return matches.reduce((best, current) => {
-      let bestScore = this.calculateMatchScore(search, best);
-      let currentScore = this.calculateMatchScore(search, current);
+      const bestScore = this.calculateMatchScore(search, best);
+      const currentScore = this.calculateMatchScore(search, current);
       return currentScore > bestScore ? current : best;
     }, matches[0]);
   }
@@ -232,6 +238,36 @@ export class SearchService {
       }
     });
 
+    // Отправляем обновленную статистику всем после матча
+    await this.broadcastSearchStats();
+
     return chat;
+  }
+
+  static async getSearchStats() {
+    const totalSearching = await Search.countDocuments({ status: 'searching' });
+    
+    const genderStats = await Search.aggregate([
+      { $match: { status: 'searching' } },
+      {
+        $group: {
+          _id: '$gender',
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    return {
+      totalSearching,
+      genderStats: genderStats.reduce((acc, stat) => {
+        acc[stat._id] = stat.count;
+        return acc;
+      }, {} as Record<string, number>)
+    };
+  }
+
+  private static async broadcastSearchStats() {
+    const stats = await this.getSearchStats();
+    wsManager.io.emit('search:stats', stats);
   }
 } 

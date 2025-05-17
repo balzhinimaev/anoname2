@@ -27,11 +27,8 @@ export class ChatService {
     // Отправляем сообщение всем участникам чата
     wsManager.io.to(`chat:${chatId}`).emit('chat:message', {
       chatId,
-      message: {
-        content,
-        sender: userId,
-        timestamp: message.timestamp
-      }
+      content,
+      userId
     });
 
     return message;
@@ -56,7 +53,7 @@ export class ChatService {
     wsManager.io.to(`chat:${chatId}`).emit('chat:read', {
       chatId,
       userId,
-      lastReadTimestamp: timestamp
+      timestamp
     });
   }
 } 

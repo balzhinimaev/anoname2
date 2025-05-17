@@ -9,7 +9,7 @@ import { metricsCollector } from '../utils/metrics';
 import { CircuitBreaker } from '../utils/CircuitBreaker';
 
 export class WebSocketManager {
-  public io: Server<ClientToServerEvents, ServerToClientEvents, {}, SocketData>;
+  public io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>;
   private userSockets: Map<string, Set<string>> = new Map(); // userId -> Set of socketIds
   private userRooms: Map<string, Set<string>> = new Map(); // userId -> Set of room names
   private chatCircuitBreaker: CircuitBreaker;

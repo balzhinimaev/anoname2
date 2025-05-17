@@ -7,9 +7,12 @@ const createAndSaveToken = async (
   user: any,
   req: Request
 ): Promise<string> => {
-  // Создаем JWT токен
+  // Создаем JWT токен с userId и telegramId
   const token = jwt.sign(
-    { telegramId: user.telegramId },
+    { 
+      userId: user._id,
+      telegramId: user.telegramId 
+    },
     process.env.JWT_SECRET || 'your-secret-key',
     { expiresIn: '30d' }
   );
@@ -66,7 +69,7 @@ export const register = async (req: Request, res: Response): Promise<void> => {
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
     const { telegramId } = req.body;
-
+    console.log(telegramId)
     // Проверяем существование пользователя
     const user = await User.findOne({ telegramId });
     if (!user) {
@@ -87,6 +90,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       }
     });
   } catch (error) {
+    console.log(error)
     res.status(500).json({ error: 'Ошибка при аутентификации' });
   }
 };
@@ -118,7 +122,12 @@ export const logout = async (req: Request, res: Response): Promise<void> => {
 
 export const logoutAll = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { telegramId } = req.user!;
+    if (!req.user) {
+      res.status(401).json({ error: 'Пользователь не авторизован' });
+      return;
+    }
+    
+    const { telegramId } = req.user;
 
     // Инвалидируем все токены пользователя
     await Token.updateMany(
