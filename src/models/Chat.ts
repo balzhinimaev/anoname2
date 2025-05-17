@@ -1,23 +1,52 @@
+/**
+ * Модель чата в системе анонимного общения
+ * @module models/Chat
+ */
+
 import mongoose from 'mongoose';
 
+/**
+ * Интерфейс сообщения в чате
+ * @interface IMessage
+ */
 interface IMessage {
+  /** ID отправителя сообщения */
   sender: mongoose.Types.ObjectId;
+  /** Текст сообщения */
   content: string;
+  /** Время отправки сообщения */
   timestamp: Date;
+  /** Статус прочтения сообщения */
   isRead: boolean;
 }
 
+/**
+ * Интерфейс чата
+ * @interface IChat
+ */
 export interface IChat {
+  /** Массив ID участников чата */
   participants: mongoose.Types.ObjectId[];
+  /** Массив сообщений в чате */
   messages: IMessage[];
+  /** Последнее сообщение в чате */
   lastMessage?: IMessage;
+  /** Тип чата: анонимный или постоянный */
   type: 'anonymous' | 'permanent';
+  /** Статус активности чата */
   isActive: boolean;
-  expiresAt?: Date; // Для анонимных чатов
+  /** Время истечения анонимного чата */
+  expiresAt?: Date;
+  /** Время создания чата */
   createdAt: Date;
+  /** Время последнего обновления чата */
   updatedAt: Date;
 }
 
+/**
+ * Схема сообщения для MongoDB
+ * @type {mongoose.Schema}
+ */
 const messageSchema = new mongoose.Schema<IMessage>({
   sender: {
     type: mongoose.Schema.Types.ObjectId,
@@ -38,6 +67,10 @@ const messageSchema = new mongoose.Schema<IMessage>({
   }
 });
 
+/**
+ * Схема чата для MongoDB
+ * @type {mongoose.Schema}
+ */
 const chatSchema = new mongoose.Schema<IChat>({
   participants: [{
     type: mongoose.Schema.Types.ObjectId,
@@ -62,26 +95,41 @@ const chatSchema = new mongoose.Schema<IChat>({
   timestamps: true
 });
 
-// Индексы
+// Индексы для оптимизации запросов
 chatSchema.index({ participants: 1 });
 chatSchema.index({ isActive: 1 });
 chatSchema.index({ type: 1 });
 
-// TTL индекс для автоматического удаления анонимных чатов
+/**
+ * TTL индекс для автоматического удаления анонимных чатов по истечении срока
+ */
 chatSchema.index(
   { expiresAt: 1 },
   { expireAfterSeconds: 0 }
 );
 
-// Методы
+/**
+ * Проверяет, является ли пользователь участником чата
+ * @param {mongoose.Types.ObjectId} userId - ID пользователя
+ * @returns {boolean} true если пользователь является участником чата
+ */
 chatSchema.methods.isParticipant = function(userId: mongoose.Types.ObjectId): boolean {
   return this.participants.some((participantId: mongoose.Types.ObjectId) => 
     participantId.equals(userId)
   );
 };
 
-// Статические методы
+/**
+ * Расширение модели чата статическими методами
+ * @interface ChatModel
+ * @extends {mongoose.Model<IChat>}
+ */
 interface ChatModel extends mongoose.Model<IChat> {
+  /**
+   * Находит все активные чаты пользователя
+   * @param {mongoose.Types.ObjectId} userId - ID пользователя
+   * @returns {Promise<IChat[]>} Массив активных чатов
+   */
   findActiveChatsForUser(userId: mongoose.Types.ObjectId): Promise<IChat[]>;
 }
 
@@ -92,7 +140,9 @@ chatSchema.statics.findActiveChatsForUser = async function(userId: mongoose.Type
   }).sort({ updatedAt: -1 });
 };
 
-// Middleware для установки срока истечения анонимных чатов
+/**
+ * Middleware для автоматической установки времени истечения анонимных чатов
+ */
 chatSchema.pre('save', function(next) {
   if (this.isNew && this.type === 'anonymous') {
     // Анонимный чат истекает через 24 часа
