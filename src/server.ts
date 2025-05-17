@@ -1,7 +1,14 @@
+/**
+ * Основной файл сервера приложения для анонимного чата.
+ * @module server
+ */
+
 import express from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import swaggerUi from 'swagger-ui-express';
+import { swaggerSpec } from './config/swagger';
 import { router as userRouter } from './routes/userRoutes';
 import { router as chatRouter } from './routes/chatRoutes';
 import { router as authRouter } from './routes/authRoutes';
@@ -20,7 +27,9 @@ const app = express();
 const httpServer = createServer(app);
 const port = process.env.PORT || 3001;
 
-// Middleware
+/**
+ * Настройка CORS для безопасного взаимодействия с клиентом
+ */
 app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:3001',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -29,7 +38,23 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Инициализация WebSocket
+/**
+ * Инициализация Swagger UI
+ */
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+  customCss: '.swagger-ui .topbar { display: none }',
+  customSiteTitle: 'API Документация | Анонимный чат',
+}));
+
+// Эндпоинт для получения спецификации OpenAPI в формате JSON
+app.get('/api-docs.json', (_req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.send(swaggerSpec);
+});
+
+/**
+ * Инициализация WebSocket менеджера для обработки реал-тайм соединений
+ */
 export const wsManager = new WebSocketManager(httpServer);
 
 // Публичные маршруты (не требуют аутентификации)
@@ -55,7 +80,10 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   res.status(500).json({ error: 'Что-то пошло не так!' });
 });
 
-// Автоматическая очистка токенов каждые 24 часа
+/**
+ * Настройка автоматической очистки устаревших токенов
+ * @function setupTokenCleanup
+ */
 const setupTokenCleanup = () => {
   const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 часа
   setInterval(async () => {
@@ -71,7 +99,12 @@ const setupTokenCleanup = () => {
   }, CLEANUP_INTERVAL);
 };
 
-// Start server
+/**
+ * Запуск сервера и инициализация всех необходимых компонентов
+ * @async
+ * @function startServer
+ * @throws {Error} Ошибка подключения к MongoDB или запуска сервера
+ */
 const startServer = async () => {
   try {
     // Подключение к MongoDB
