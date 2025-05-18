@@ -16,8 +16,14 @@ export interface ServerToClientEvents {
     status: 'searching' | 'cancelled' | 'expired' | 'matched'
   }) => void;
   'search:stats': (data: {
-    totalSearching: number;
-    genderStats: Record<string, number>;
+    t: number;  // total searching
+    m: number;  // male searching
+    f: number;  // female searching
+    online: {
+      t: number;  // total online
+      m: number;  // male online
+      f: number;  // female online
+    }
   }) => void;
 
   // Чаты и сообщения
@@ -58,7 +64,7 @@ export interface ClientToServerEvents {
     criteria: {
       gender: 'male' | 'female';
       age: number;
-      rating: number;
+      rating?: number;
       desiredGender: ('male' | 'female' | 'any')[];
       desiredAgeMin: number;
       desiredAgeMax: number;
@@ -95,6 +101,10 @@ export interface ClientToServerEvents {
     userId: string;
     status: 'accepted' | 'declined' | 'blocked';
   }) => void;
+
+  // Подписка на статистику
+  'search:subscribe_stats': () => void;
+  'search:unsubscribe_stats': () => void;
 }
 
 export interface SocketData {

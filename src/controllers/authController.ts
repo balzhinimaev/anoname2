@@ -58,7 +58,8 @@ export const register = async (req: Request, res: Response): Promise<void> => {
         telegramId: user.telegramId,
         username: user.username,
         firstName: user.firstName,
-        lastName: user.lastName
+        lastName: user.lastName,
+        rating: user.rating || 0
       }
     });
   } catch (error) {
@@ -86,7 +87,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         telegramId: user.telegramId,
         username: user.username,
         firstName: user.firstName,
-        lastName: user.lastName
+        lastName: user.lastName,
+        rating: user.rating || 0
       }
     });
   } catch (error) {

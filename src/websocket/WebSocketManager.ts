@@ -7,6 +7,7 @@ import { SearchService, SearchCriteria, SearchResult } from '../services/SearchS
 import { wsLogger } from '../utils/logger';
 import { metricsCollector } from '../utils/metrics';
 import { CircuitBreaker } from '../utils/CircuitBreaker';
+import User from '../models/User';
 
 export class WebSocketManager {
   public io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>;
@@ -32,7 +33,11 @@ export class WebSocketManager {
       transports: ['websocket'],
       allowEIO3: true,
       path: '/socket.io/',
-      serveClient: false
+      serveClient: false,
+      maxHttpBufferSize: 1e6, // 1MB
+      httpCompression: {
+        threshold: 1024 // Сжимать данные больше 1KB
+      }
     });
 
     // Добавляем обработчик ошибок соединения
@@ -91,10 +96,73 @@ export class WebSocketManager {
       // Метрики подключения
       metricsCollector.connectionOpened();
       
+      // Обновляем статус активности пользователя
+      User.findByIdAndUpdate(userId, {
+        isActive: true,
+        lastActive: new Date()
+      }).then(() => {
+        // Обновляем статистику после изменения статуса
+        SearchService.broadcastSearchStats().catch((error: unknown) => {
+          wsLogger.error('update_stats', userId, error as Error);
+        });
+      }).catch((error: unknown) => {
+        wsLogger.error('update_activity', userId, error as Error);
+      });
+
+      // Устанавливаем интервал обновления активности
+      const activityInterval = setInterval(() => {
+        User.findByIdAndUpdate(userId, {
+          lastActive: new Date()
+        }).then(() => {
+          // Обновляем статистику после каждого обновления активности
+          SearchService.broadcastSearchStats().catch((error: unknown) => {
+            wsLogger.error('update_stats', userId, error as Error);
+          });
+        }).catch((error: unknown) => {
+          wsLogger.error('update_activity', userId, error as Error);
+        });
+      }, 10000); // Обновляем каждые 10 секунд
+
       // Логируем подключение
       wsLogger.connection(userId, socket.id, {
         isReconnection,
         telegramId: socket.data.user.telegramId
+      });
+
+      // Подписка на статистику
+      socket.on('search:subscribe_stats', async () => {
+        const roomSize = this.io.sockets.adapter.rooms.get('search_stats_room')?.size || 0;
+        wsLogger.info('stats_subscribe', 'Подписка на статистику', {
+          userId,
+          socketId: socket.id,
+          currentSubscribers: roomSize
+        });
+
+        socket.join('search_stats_room');
+        
+        // Отправляем текущую статистику сразу после подписки
+        try {
+          const stats = await SearchService.getSearchStats();
+          socket.emit('search:stats', stats);
+          wsLogger.info('stats_initial_sent', 'Отправлена начальная статистика', {
+            userId,
+            socketId: socket.id,
+            stats
+          });
+        } catch (error) {
+          wsLogger.error('stats_initial', userId, error as Error);
+        }
+      });
+
+      socket.on('search:unsubscribe_stats', () => {
+        const roomSize = this.io.sockets.adapter.rooms.get('search_stats_room')?.size || 0;
+        wsLogger.info('stats_unsubscribe', 'Отписка от статистики', {
+          userId,
+          socketId: socket.id,
+          currentSubscribers: roomSize
+        });
+
+        socket.leave('search_stats_room');
       });
 
       // Добавляем сокет в мапу пользователя
@@ -198,14 +266,25 @@ export class WebSocketManager {
 
       // Обработка отключения
       socket.on('disconnect', (reason) => {
+        // Очищаем интервал обновления активности
+        clearInterval(activityInterval);
+
         const duration = Date.now() - connectionStart;
         metricsCollector.connectionClosed();
         
         this.userSockets.get(userId)?.delete(socket.id);
         
-        // Удаляем информацию о пользователе только если все его сокеты отключились
-        if (this.userSockets.get(userId)?.size === 0) {
+        // Если это последний сокет пользователя
+        if (!this.userSockets.get(userId)?.size) {
           this.userSockets.delete(userId);
+          
+          // Обновляем статус активности
+          User.findByIdAndUpdate(userId, {
+            isActive: false,
+            lastActive: new Date()
+          }).catch((error: unknown) => {
+            wsLogger.error('update_activity', userId, error as Error);
+          });
           
           // При полном отключении сохраняем состояние на 2 минуты
           setTimeout(() => {

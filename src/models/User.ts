@@ -23,6 +23,8 @@ export interface IUser extends Document {
   bio?: string;
   /** Пол пользователя */
   gender?: 'male' | 'female' | 'other';
+  /** Рейтинг пользователя */
+  rating: number;
   /** Предпочтения пользователя для поиска собеседников */
   preferences?: {
     /** Предпочитаемый пол собеседника */
@@ -60,6 +62,7 @@ const UserSchema: Schema = new Schema({
   lastName: { type: String },
   bio: { type: String },
   gender: { type: String, enum: ['male', 'female', 'other'] },
+  rating: { type: Number, default: 0 },
   preferences: {
     gender: { type: String, enum: ['male', 'female', 'any'] },
     ageRange: {

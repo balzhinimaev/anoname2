@@ -2,11 +2,13 @@ import Search, { ISearch } from '../models/Search';
 import Chat from '../models/Chat';
 import { wsManager } from '../server';
 import mongoose from 'mongoose';
+import User from '../models/User';
+import { wsLogger } from '../utils/logger';
 
 export interface SearchCriteria {
   gender: 'male' | 'female';
   age: number;
-  rating: number;
+  rating?: number;
   desiredGender: ('male' | 'female' | 'any')[];
   desiredAgeMin: number;
   desiredAgeMax: number;
@@ -31,6 +33,14 @@ export interface SearchResult {
 }
 
 export class SearchService {
+  private static debounceTimeout: NodeJS.Timeout | null = null;
+  private static readonly DEBOUNCE_DELAY = 2000; // 2 секунды
+  private static statsCache: {
+    data: any;
+    timestamp: number;
+  } | null = null;
+  private static readonly CACHE_TTL = 5000; // 5 секунд
+
   static async startSearch(
     userId: string,
     telegramId: string,
@@ -49,7 +59,7 @@ export class SearchService {
       status: 'searching',
       gender: criteria.gender,
       age: criteria.age,
-      rating: criteria.rating,
+      rating: criteria.rating ?? 0,
       desiredGender: criteria.desiredGender,
       desiredAgeMin: criteria.desiredAgeMin,
       desiredAgeMax: criteria.desiredAgeMax,
@@ -245,29 +255,85 @@ export class SearchService {
   }
 
   static async getSearchStats() {
-    const totalSearching = await Search.countDocuments({ status: 'searching' });
-    
-    const genderStats = await Search.aggregate([
-      { $match: { status: 'searching' } },
-      {
-        $group: {
-          _id: '$gender',
-          count: { $sum: 1 }
+    wsLogger.info('stats_request', 'Запрос статистики');
+
+    // Используем кэш если он свежий
+    if (this.statsCache && Date.now() - this.statsCache.timestamp < this.CACHE_TTL) {
+      wsLogger.info('stats_cache_hit', 'Возврат статистики из кэша', {
+        cacheAge: Date.now() - this.statsCache.timestamp
+      });
+      return this.statsCache.data;
+    }
+
+    wsLogger.info('stats_cache_miss', 'Получение свежей статистики');
+
+    // Получаем статистику поиска
+    const [searchingStats, onlineStats] = await Promise.all([
+      // Статистика поиска
+      Search.aggregate([
+        { $match: { status: 'searching' } },
+        {
+          $group: {
+            _id: '$gender',
+            count: { $sum: 1 }
+          }
         }
-      }
+      ]),
+      // Статистика онлайн пользователей
+      User.aggregate([
+        { 
+          $match: { 
+            isActive: true,
+            lastActive: { 
+              $gte: new Date(Date.now() - 30 * 1000) // активны за последние 30 секунд
+            }
+          }
+        },
+        {
+          $group: {
+            _id: '$gender',
+            count: { $sum: 1 }
+          }
+        }
+      ])
     ]);
 
-    return {
-      totalSearching,
-      genderStats: genderStats.reduce((acc, stat) => {
-        acc[stat._id] = stat.count;
-        return acc;
-      }, {} as Record<string, number>)
+    const stats = {
+      // Статистика поиска
+      t: searchingStats.reduce((sum, stat) => sum + stat.count, 0),
+      m: searchingStats.find(s => s._id === 'male')?.count || 0,
+      f: searchingStats.find(s => s._id === 'female')?.count || 0,
+      // Статистика онлайн
+      online: {
+        t: onlineStats.reduce((sum, stat) => sum + stat.count, 0),
+        m: onlineStats.find(s => s._id === 'male')?.count || 0,
+        f: onlineStats.find(s => s._id === 'female')?.count || 0
+      }
     };
+
+    // Обновляем кэш
+    this.statsCache = {
+      data: stats,
+      timestamp: Date.now()
+    };
+
+    wsLogger.info('stats_updated', 'Статистика обновлена', stats);
+    return stats;
   }
 
-  private static async broadcastSearchStats() {
-    const stats = await this.getSearchStats();
-    wsManager.io.emit('search:stats', stats);
+  public static async broadcastSearchStats() {
+    if (this.debounceTimeout) {
+      clearTimeout(this.debounceTimeout);
+      wsLogger.info('stats_debounce', 'Сброс таймера дебаунса');
+    }
+    
+    this.debounceTimeout = setTimeout(async () => {
+      wsLogger.info('stats_broadcast_start', 'Начало рассылки статистики');
+      const stats = await this.getSearchStats();
+      wsManager.io.to('search_stats_room').emit('search:stats', stats);
+      wsLogger.info('stats_broadcast_complete', 'Статистика разослана', {
+        subscribersCount: wsManager.io.sockets.adapter.rooms.get('search_stats_room')?.size || 0
+      });
+    }, this.DEBOUNCE_DELAY);
   }
 } 
