@@ -2,8 +2,8 @@ import Search, { ISearch } from '../models/Search';
 import Chat from '../models/Chat';
 import { wsManager } from '../server';
 import mongoose from 'mongoose';
-import User from '../models/User';
 import { wsLogger } from '../utils/logger';
+import User from '../models/User';
 
 export interface SearchCriteria {
   gender: 'male' | 'female';
@@ -46,6 +46,35 @@ export class SearchService {
     telegramId: string,
     criteria: SearchCriteria
   ): Promise<SearchResult> {
+    // Добавляем логирование полученных критериев
+    wsLogger.info('search_service_start', 'Запуск поиска в сервисе', {
+      userId,
+      telegramId,
+      criteria: {
+        gender: criteria.gender,
+        age: criteria.age,
+        desiredGender: criteria.desiredGender,
+        desiredAgeMin: criteria.desiredAgeMin,
+        desiredAgeMax: criteria.desiredAgeMax,
+        useGeolocation: criteria.useGeolocation,
+        hasLocation: !!criteria.location,
+        location: criteria.location ? {
+          longitude: criteria.location.longitude,
+          latitude: criteria.location.latitude
+        } : null,
+        maxDistance: criteria.maxDistance
+      }
+    });
+    
+    // Добавляем явный вывод в консоль для отладки
+    console.log('🔍 SEARCH START REQUEST:', {
+      userId,
+      telegramId,
+      useGeolocation: criteria.useGeolocation,
+      location: criteria.location,
+      maxDistance: criteria.maxDistance
+    });
+
     // Отменяем предыдущий поиск, если есть
     await Search.findOneAndUpdate(
       { userId, status: 'searching' },
@@ -71,10 +100,17 @@ export class SearchService {
       } : undefined,
       maxDistance: criteria.maxDistance
     });
-
-    // Отправляем обновленную статистику всем
-    await this.broadcastSearchStats();
-
+    
+    // Логируем созданную запись поиска с фокусом на геоданные
+    wsLogger.info('search_record_created', 'Запись поиска создана', {
+      userId,
+      searchId: search._id?.toString(),
+      useGeolocation: search.useGeolocation,
+      hasLocation: !!search.location,
+      coordinates: search.location ? search.location.coordinates : null,
+      maxDistance: search.maxDistance
+    });
+    
     // Ищем подходящий мэтч
     const matches = await this.findMatches(search);
     if (matches.length > 0) {
@@ -87,6 +123,9 @@ export class SearchService {
         );
       }
     }
+
+    // Атомарно обновляем статистику после начала поиска
+    await this.updateAndBroadcastStats('start', userId);
 
     // Преобразуем результат в SearchResult
     return {
@@ -108,8 +147,8 @@ export class SearchService {
       { new: true }
     );
 
-    // Отправляем обновленную статистику всем
-    await this.broadcastSearchStats();
+    // Атомарно обновляем статистику после отмены поиска
+    await this.updateAndBroadcastStats('cancel', userId);
 
     return search;
   }
@@ -249,26 +288,30 @@ export class SearchService {
     });
 
     // Отправляем обновленную статистику всем после матча
-    await this.broadcastSearchStats();
+    // Используем новый метод для обновления статистики с учетом среднего времени
+    await this.updateAndBroadcastStats('match', search1.userId.toString());
 
     return chat;
   }
 
   static async getSearchStats() {
-    wsLogger.info('stats_request', 'Запрос статистики');
+    // Уменьшаем логирование
+    // wsLogger.info('stats_request', 'Запрос статистики');
 
     // Используем кэш если он свежий
     if (this.statsCache && Date.now() - this.statsCache.timestamp < this.CACHE_TTL) {
-      wsLogger.info('stats_cache_hit', 'Возврат статистики из кэша', {
-        cacheAge: Date.now() - this.statsCache.timestamp
-      });
+      // Уменьшаем логирование
+      // wsLogger.info('stats_cache_hit', 'Возврат статистики из кэша', {
+      //   cacheAge: Date.now() - this.statsCache.timestamp
+      // });
       return this.statsCache.data;
     }
 
-    wsLogger.info('stats_cache_miss', 'Получение свежей статистики');
-
+    // Уменьшаем логирование
+    // wsLogger.info('stats_cache_miss', 'Получение свежей статистики');
+    
     // Получаем статистику поиска
-    const [searchingStats, onlineStats] = await Promise.all([
+    const [searchingStats, onlineStats, avgSearchTimeStats] = await Promise.all([
       // Статистика поиска
       Search.aggregate([
         { $match: { status: 'searching' } },
@@ -295,9 +338,45 @@ export class SearchService {
             count: { $sum: 1 }
           }
         }
+      ]),
+      // Статистика по времени поиска (для мэтчей за последние 24 часа)
+      Search.aggregate([
+        { 
+          $match: { 
+            status: 'matched',
+            updatedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } // за последние 24 часа
+          } 
+        },
+        {
+          $project: {
+            searchDuration: { 
+              $subtract: ['$updatedAt', '$createdAt'] // разница в миллисекундах
+            },
+            gender: 1
+          }
+        },
+        {
+          $group: {
+            _id: '$gender',
+            avgTime: { $avg: '$searchDuration' }, // среднее время в мс
+            count: { $sum: 1 }
+          }
+        }
       ])
     ]);
 
+    // Расчет общего среднего времени поиска
+    let totalSearchTime = 0;
+    let totalSearchCount = 0;
+    
+    avgSearchTimeStats.forEach(stat => {
+      totalSearchTime += (stat.avgTime || 0) * stat.count;
+      totalSearchCount += stat.count;
+    });
+    
+    const avgSearchTimeTotal = totalSearchCount > 0 ? 
+      Math.round(totalSearchTime / totalSearchCount / 1000) : 0; // в секундах
+    
     const stats = {
       // Статистика поиска
       t: searchingStats.reduce((sum, stat) => sum + stat.count, 0),
@@ -308,32 +387,185 @@ export class SearchService {
         t: onlineStats.reduce((sum, stat) => sum + stat.count, 0),
         m: onlineStats.find(s => s._id === 'male')?.count || 0,
         f: onlineStats.find(s => s._id === 'female')?.count || 0
+      },
+      // Статистика по времени поиска (в секундах)
+      avgSearchTime: {
+        t: avgSearchTimeTotal,
+        m: Math.round((avgSearchTimeStats.find(s => s._id === 'male')?.avgTime || 0) / 1000),
+        f: Math.round((avgSearchTimeStats.find(s => s._id === 'female')?.avgTime || 0) / 1000),
+        // Дополнительно - количество успешных мэтчей за 24 часа
+        matches24h: totalSearchCount
       }
     };
-
+    
     // Обновляем кэш
     this.statsCache = {
       data: stats,
       timestamp: Date.now()
     };
 
-    wsLogger.info('stats_updated', 'Статистика обновлена', stats);
+    // wsLogger.info('stats_updated', 'Статистика обновлена', stats);
     return stats;
+  }
+
+  /**
+   * Получает активный поиск пользователя по его ID
+   * @param userId ID пользователя
+   * @returns Объект поиска или null, если пользователь не в поиске
+   */
+  static async getUserActiveSearch(userId: string) {
+    return await Search.findOne({
+      userId: new mongoose.Types.ObjectId(userId),
+      status: 'searching'
+    });
   }
 
   public static async broadcastSearchStats() {
     if (this.debounceTimeout) {
       clearTimeout(this.debounceTimeout);
-      wsLogger.info('stats_debounce', 'Сброс таймера дебаунса');
+      // wsLogger.info('stats_debounce', 'Сброс таймера дебаунса');
     }
     
     this.debounceTimeout = setTimeout(async () => {
-      wsLogger.info('stats_broadcast_start', 'Начало рассылки статистики');
+      // wsLogger.info('stats_broadcast_start', 'Начало рассылки статистики');
       const stats = await this.getSearchStats();
       wsManager.io.to('search_stats_room').emit('search:stats', stats);
-      wsLogger.info('stats_broadcast_complete', 'Статистика разослана', {
-        subscribersCount: wsManager.io.sockets.adapter.rooms.get('search_stats_room')?.size || 0
-      });
+      // wsLogger.info('stats_broadcast_complete', 'Статистика разослана', {
+      //   subscribersCount: wsManager.io.sockets.adapter.rooms.get('search_stats_room')?.size || 0
+      // });
     }, this.DEBOUNCE_DELAY);
   }
+
+  /**
+   * Атомарное обновление и отправка статистики всем подписчикам
+   * @param action Тип действия ('start', 'cancel', 'match')
+   * @param userId ID пользователя, выполнившего действие
+   */
+  private static async updateAndBroadcastStats(action: 'start' | 'cancel' | 'match', userId: string) {
+    // Используем семафор для предотвращения одновременного доступа к статистике
+    if (this.updatingStats) {
+      wsLogger.info('stats_update_queued', `Запрос на обновление статистики (${action}) поставлен в очередь`, {
+        userId,
+        action
+      });
+      // Если обновление уже идет, просто запланируем broadcastSearchStats
+      this.pendingUpdates = true;
+      return;
+    }
+
+    try {
+      this.updatingStats = true;
+      
+      let stats;
+      
+      // Пробуем обновить кэш инкрементно вместо полного сброса
+      if (this.statsCache && Date.now() - this.statsCache.timestamp < this.CACHE_TTL) {
+        // Если есть свежий кэш и действие предсказуемо, обновляем инкрементно
+        const userSearch = action === 'start' ? 
+          await this.getUserActiveSearch(userId) : null;
+          
+        if (action === 'start' && userSearch) {
+          // Инкрементно обновляем кэш при начале поиска
+          const gender = userSearch.gender as 'male' | 'female';
+          if (gender === 'male' || gender === 'female') {
+            this.statsCache.data.t += 1;
+            this.statsCache.data[gender.charAt(0)] += 1;
+            stats = { ...this.statsCache.data }; // создаем копию данных
+            wsLogger.info('stats_incremental_update', 'Инкрементное обновление кэша (начало поиска)', { 
+              gender, 
+              userId 
+            });
+          } else {
+            // Если пол неизвестен, делаем полное обновление
+            this.statsCache = null;
+            stats = await this.getSearchStats();
+          }
+        } else if (action === 'cancel') {
+          // Декрементно обновляем кэш при отмене поиска, но только если точно знаем пол
+          const canceledSearch = await Search.findOne({
+            userId: new mongoose.Types.ObjectId(userId),
+            status: 'cancelled'
+          });
+          
+          if (canceledSearch && (canceledSearch.gender === 'male' || canceledSearch.gender === 'female')) {
+            const gender = canceledSearch.gender as 'male' | 'female';
+            // Уменьшаем только количество ищущих, не трогая онлайн
+            this.statsCache.data.t = Math.max(0, this.statsCache.data.t - 1);
+            this.statsCache.data[gender.charAt(0)] = Math.max(0, this.statsCache.data[gender.charAt(0)] - 1);
+            
+            // Убеждаемся что статистика онлайн сохраняется
+            const currentStats = { ...this.statsCache.data }; // создаем копию данных
+            
+            // Если по какой-то причине кэш не содержит данных об онлайн, запрашиваем свежие данные
+            if (!currentStats.online) {
+              const freshStats = await this.getSearchStats();
+              // Обновляем только данные о поиске, сохраняя актуальную информацию онлайн
+              this.statsCache = {
+                data: {
+                  ...freshStats,
+                  t: currentStats.t,
+                  m: currentStats.m,
+                  f: currentStats.f
+                },
+                timestamp: Date.now()
+              };
+              stats = this.statsCache.data;
+            } else {
+              stats = currentStats;
+            }
+            
+            wsLogger.info('stats_incremental_update', 'Инкрементное обновление кэша (отмена поиска)', { 
+              gender, 
+              userId 
+            });
+          } else {
+            // Если не нашли отмененный поиск, делаем полное обновление
+            this.statsCache = null;
+            stats = await this.getSearchStats();
+          }
+        } else if (action === 'match') {
+          // При матче мы не меняем текущую статистику поиска, но можем обновить
+          // статистику среднего времени поиска. Для простоты делаем полное обновление
+          // при матчах, так как это редкое событие и требуется точность.
+          this.statsCache = null;
+          stats = await this.getSearchStats();
+        } else {
+          // Для других действий или при сложных сценариях делаем полное обновление
+          this.statsCache = null;
+          stats = await this.getSearchStats();
+        }
+      } else {
+        // Если кэш устарел или отсутствует, получаем свежую статистику
+        this.statsCache = null;
+        stats = await this.getSearchStats();
+      }
+      
+      // Отправляем статистику всем подписчикам сразу
+      wsManager.io.to('search_stats_room').emit('search:stats', stats);
+      
+      wsLogger.info('stats_force_update', `Статистика отправлена после действия: ${action}`, {
+        userId,
+        stats,
+        fromCache: !!this.statsCache
+      });
+      
+    } catch (error) {
+      wsLogger.error('stats_update_error', userId, error as Error, {
+        action
+      });
+    } finally {
+      // Снимаем блокировку
+      this.updatingStats = false;
+      
+      // Если были запросы на обновление во время выполнения, запускаем стандартный механизм
+      if (this.pendingUpdates) {
+        this.pendingUpdates = false;
+        await this.broadcastSearchStats();
+      }
+    }
+  }
+  
+  // Флаги для контроля конкурентных обновлений
+  private static updatingStats = false;
+  private static pendingUpdates = false;
 } 

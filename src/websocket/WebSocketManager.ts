@@ -9,6 +9,9 @@ import { metricsCollector } from '../utils/metrics';
 import { CircuitBreaker } from '../utils/CircuitBreaker';
 import User from '../models/User';
 
+// Создаем статическую карту для хранения таймаутов
+const pendingSearchCancellations = new Map<string, NodeJS.Timeout>();
+
 export class WebSocketManager {
   public io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>;
   private userSockets: Map<string, Set<string>> = new Map(); // userId -> Set of socketIds
@@ -45,29 +48,6 @@ export class WebSocketManager {
       wsLogger.error('system', 'socket.io', new Error(err.message), {
         code: err.code,
         context: err.context
-      });
-    });
-
-    // Добавляем обработчик подключения для отладки
-    this.io.engine.on('initial_headers', (headers: any, req: any) => {
-      wsLogger.info('connection_headers', 'Initial headers received', {
-        headers: headers,
-        url: req.url
-      });
-    });
-
-    // Добавляем логирование для всех входящих событий
-    this.io.engine.on('headers', (headers: any, req: any) => {
-      wsLogger.info('debug', 'Headers event received', {
-        headers: headers,
-        url: req.url
-      });
-    });
-
-    this.io.engine.on('connection', (socket: any) => {
-      wsLogger.info('debug', 'Raw socket connection', {
-        id: socket.id,
-        headers: socket.handshake?.headers
       });
     });
 
@@ -131,37 +111,35 @@ export class WebSocketManager {
 
       // Подписка на статистику
       socket.on('search:subscribe_stats', async () => {
-        const roomSize = this.io.sockets.adapter.rooms.get('search_stats_room')?.size || 0;
-        wsLogger.info('stats_subscribe', 'Подписка на статистику', {
-          userId,
-          socketId: socket.id,
-          currentSubscribers: roomSize
-        });
-
         socket.join('search_stats_room');
         
         // Отправляем текущую статистику сразу после подписки
         try {
+          // Получаем текущую статистику
           const stats = await SearchService.getSearchStats();
+          
+          // Проверяем, находится ли пользователь в активном поиске
+          const userSearch = await SearchService.getUserActiveSearch(userId);
+          
+          // Если пользователь уже в поиске, но не включен в статистику - учитываем его
+          if (userSearch && userSearch.status === 'searching') {
+            const userGender = userSearch.gender || 'unknown';
+            if (userGender === 'male') {
+              stats.m += 1;
+              stats.t += 1;
+            } else if (userGender === 'female') {
+              stats.f += 1;
+              stats.t += 1;
+            }
+          }
+          
           socket.emit('search:stats', stats);
-          wsLogger.info('stats_initial_sent', 'Отправлена начальная статистика', {
-            userId,
-            socketId: socket.id,
-            stats
-          });
         } catch (error) {
           wsLogger.error('stats_initial', userId, error as Error);
         }
       });
 
       socket.on('search:unsubscribe_stats', () => {
-        const roomSize = this.io.sockets.adapter.rooms.get('search_stats_room')?.size || 0;
-        wsLogger.info('stats_unsubscribe', 'Отписка от статистики', {
-          userId,
-          socketId: socket.id,
-          currentSubscribers: roomSize
-        });
-
         socket.leave('search_stats_room');
       });
 
@@ -185,6 +163,14 @@ export class WebSocketManager {
             wsLogger.event('room_rejoin', userId, socket.id, { room });
           });
         }
+        
+        // Очищаем таймер отмены поиска, если пользователь переподключился
+        const cancelTimeout = pendingSearchCancellations.get(userId);
+        if (cancelTimeout) {
+          clearTimeout(cancelTimeout);
+          pendingSearchCancellations.delete(userId);
+        }
+        
         socket.emit('connection:recovered');
       }
 
@@ -278,6 +264,46 @@ export class WebSocketManager {
         if (!this.userSockets.get(userId)?.size) {
           this.userSockets.delete(userId);
           
+          // Получаем статус активного поиска
+          SearchService.getUserActiveSearch(userId).then(activeSearch => {
+            if (activeSearch && activeSearch.status === 'searching') {
+              // Логируем информацию о потенциальной отмене поиска
+              wsLogger.info('search_disconnect_detected', 'Обнаружено отключение пользователя в поиске', {
+                userId,
+                searchId: activeSearch._id?.toString(),
+                disconnectReason: reason
+              });
+              
+              // Даем время на переподключение (10 секунд) прежде чем отменить поиск
+              const searchCancelTimeout = setTimeout(async () => {
+                // Проверяем, не переподключился ли пользователь за это время
+                if (!this.userSockets.has(userId)) {
+                  try {
+                    // Повторно проверяем, существует ли еще активный поиск
+                    const currentSearch = await SearchService.getUserActiveSearch(userId);
+                    if (currentSearch && currentSearch.status === 'searching') {
+                      wsLogger.info('search_auto_cancel', 'Автоматическая отмена поиска после таймаута', {
+                        userId,
+                        searchId: currentSearch._id?.toString(),
+                        disconnectReason: reason,
+                        disconnectDuration: Date.now() - connectionStart
+                      });
+                      
+                      await SearchService.cancelSearch(userId);
+                    }
+                  } catch (error) {
+                    wsLogger.error('search_auto_cancel', userId, error as Error);
+                  }
+                }
+              }, 10000); // 10 секунд на переподключение
+              
+              // Сохраняем таймаут в объект для возможности очистки при переподключении
+              pendingSearchCancellations.set(userId, searchCancelTimeout);
+            }
+          }).catch(error => {
+            wsLogger.error('get_active_search', userId, error as Error);
+          });
+          
           // Обновляем статус активности
           User.findByIdAndUpdate(userId, {
             isActive: false,
@@ -362,6 +388,34 @@ export class WebSocketManager {
   private async handleSearchStart(socket: TypedSocket, data: { criteria: SearchCriteria }) {
     const userId = socket.data.user._id.toString();
     try {
+      // Детальное логирование полученных критериев поиска, включая геолокацию
+      wsLogger.info('search_criteria_received', 'Получены критерии поиска', {
+        userId,
+        socketId: socket.id,
+        telegramId: socket.data.user.telegramId,
+        criteria: {
+          ...data.criteria,
+          // Логируем особенно геолокационные данные
+          useGeolocation: data.criteria.useGeolocation,
+          hasLocation: !!data.criteria.location,
+          location: data.criteria.location ? {
+            longitude: data.criteria.location.longitude,
+            latitude: data.criteria.location.latitude
+          } : null,
+          maxDistance: data.criteria.maxDistance
+        }
+      });
+
+      // Добавляем прямой вывод в консоль для отладки
+      console.log('📡 WEBSOCKET RECEIVED SEARCH:', {
+        userId, 
+        telegramId: socket.data.user.telegramId,
+        useGeolocation: data.criteria.useGeolocation,
+        hasLocation: !!data.criteria.location,
+        location: data.criteria.location,
+        criteria: data.criteria
+      });
+
       await this.searchCircuitBreaker.execute(
         async () => {
           const telegramId = socket.data.user.telegramId;
@@ -406,6 +460,14 @@ export class WebSocketManager {
         // Удаляем пользователя из комнаты поиска
         socket.leave(`search:${userId}`);
         socket.emit('search:status', { status: 'cancelled' });
+        
+        // Обновляем статус активности пользователя, чтобы убедиться что он остается активным
+        User.findByIdAndUpdate(userId, {
+          isActive: true,
+          lastActive: new Date()
+        }).catch((error: unknown) => {
+          wsLogger.error('update_activity_after_cancel', userId, error as Error);
+        });
       }
 
     } catch (error) {
