@@ -8,6 +8,8 @@ export interface ServerToClientEvents {
   'search:matched': (data: {
     matchedUser: {
       telegramId: string;
+      gender: 'male' | 'female';
+      age: number;
       chatId: string;
     };
   }) => void;

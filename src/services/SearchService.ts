@@ -33,8 +33,6 @@ export interface SearchResult {
 }
 
 export class SearchService {
-  private static debounceTimeout: NodeJS.Timeout | null = null;
-  private static readonly DEBOUNCE_DELAY = 2000; // 2 секунды
   private static statsCache: {
     data: any;
     timestamp: number;
@@ -81,8 +79,8 @@ export class SearchService {
       { status: 'cancelled' }
     );
 
-    // Создаем новый поиск
-    const search = await Search.create({
+    // Создаем объект для нового поиска
+    const searchData: any = {
       userId: new mongoose.Types.ObjectId(userId),
       telegramId,
       status: 'searching',
@@ -94,12 +92,20 @@ export class SearchService {
       desiredAgeMax: criteria.desiredAgeMax,
       minAcceptableRating: criteria.minAcceptableRating ?? -1,
       useGeolocation: criteria.useGeolocation,
-      location: criteria.location ? {
+      // maxDistance устанавливаем только если используется геолокация
+      maxDistance: criteria.useGeolocation ? (criteria.maxDistance || 10) : undefined
+    };
+
+    // Добавляем местоположение только если используется геолокация и координаты предоставлены
+    if (criteria.useGeolocation && criteria.location) {
+      searchData.location = {
         type: 'Point',
         coordinates: [criteria.location.longitude, criteria.location.latitude]
-      } : undefined,
-      maxDistance: criteria.maxDistance
-    });
+      };
+    }
+
+    // Создаем новый поиск
+    const search = await Search.create(searchData);
     
     // Логируем созданную запись поиска с фокусом на геоданные
     wsLogger.info('search_record_created', 'Запись поиска создана', {
@@ -158,30 +164,47 @@ export class SearchService {
     const matchCriteria: any = {
       status: 'searching',
       userId: { $ne: search.userId },
-      // Проверяем, что пол пользователя соответствует желаемому полу других
-      gender: { 
-        $in: ['any', ...search.desiredGender] 
-      },
-      // Проверяем, что наш пол соответствует желаемому полу других
-      desiredGender: {
-        $in: [search.gender, 'any']
-      },
-      // Проверяем возрастные ограничения (в обе стороны)
-      age: { 
-        $gte: search.desiredAgeMin,
-        $lte: search.desiredAgeMax
-      },
-      desiredAgeMin: { $lte: search.age },
-      desiredAgeMax: { $gte: search.age }
     };
+
+    // Корректная обработка желаемого пола
+    let gendersToMatch: ('male' | 'female')[] = [];
+    if (search.desiredGender.includes('any')) {
+      gendersToMatch = ['male', 'female'];
+    } else {
+      // Убедимся, что отфильтровываем 'any', если он там случайно оказался,
+      // и приводим к нужному типу.
+      gendersToMatch = search.desiredGender.filter(g => g === 'male' || g === 'female') as ('male' | 'female')[];
+    }
+    matchCriteria.gender = { $in: gendersToMatch };
+
+    // Проверяем, что наш пол соответствует желаемому полу других
+    matchCriteria.desiredGender = {
+      $in: [search.gender, 'any']
+    };
+
+    // Проверяем возрастные ограничения (в обе стороны)
+    matchCriteria.age = { 
+      $gte: search.desiredAgeMin,
+      $lte: search.desiredAgeMax
+    };
+    matchCriteria.desiredAgeMin = { $lte: search.age };
+    matchCriteria.desiredAgeMax = { $gte: search.age };
 
     // Добавляем фильтр по рейтингу
     if (search.minAcceptableRating > -1) {
       matchCriteria.rating = { $gte: search.minAcceptableRating };
     }
 
-    // Добавляем геолокационные критерии если нужно
-    if (search.useGeolocation && search.location) {
+    // Если мы не используем геолокацию, не учитываем ее в критериях поиска
+    if (!search.useGeolocation) {
+      // Либо другой пользователь также не использует геолокацию, либо мы игнорируем этот параметр
+      matchCriteria.$or = [
+        { useGeolocation: false },
+        { useGeolocation: true }
+      ];
+    }
+    // Если используем геолокацию, применяем стандартную логику
+    else if (search.useGeolocation && search.location) {
       matchCriteria.useGeolocation = true;
       matchCriteria.location = {
         $near: {
@@ -198,374 +221,376 @@ export class SearchService {
   }
 
   private static selectBestMatch(search: ISearch, matches: ISearch[]): ISearch {
-    return matches.reduce((best, current) => {
-      const bestScore = this.calculateMatchScore(search, best);
-      const currentScore = this.calculateMatchScore(search, current);
-      return currentScore > bestScore ? current : best;
-    }, matches[0]);
+    try {
+      // Защита от пустого массива
+      if (!matches || matches.length === 0) {
+        wsLogger.info('select_best_match', 'Попытка выбрать лучший матч из пустого массива', {
+          searchId: search._id?.toString()
+        });
+        throw new Error('No matches available for selection');
+      }
+
+      return matches.reduce((best, current) => {
+        try {
+          const bestScore = this.calculateMatchScore(search, best);
+          const currentScore = this.calculateMatchScore(search, current);
+          return currentScore > bestScore ? current : best;
+        } catch (error) {
+          // В случае ошибки при расчете, логируем и возвращаем лучший предыдущий матч
+          wsLogger.warn('match_score_calc', (error as Error).message, {
+            searchId: search._id?.toString(),
+            bestId: best._id?.toString(),
+            currentId: current._id?.toString()
+          });
+          return best;
+        }
+      }, matches[0]);
+    } catch (error) {
+      // В случае общей ошибки возвращаем первый матч как запасной вариант
+      wsLogger.warn('select_best_match', (error as Error).message, {
+        searchId: search._id?.toString()
+      });
+      return matches[0];
+    }
   }
 
   private static calculateMatchScore(search: ISearch, match: ISearch): number {
-    let score = 0;
+    try {
+      let score = 0;
 
-    // Близость рейтинга (максимум 40 баллов)
-    const ratingDiff = Math.abs(search.rating - match.rating);
-    score += Math.max(0, 40 - ratingDiff * 2);
+      // Близость рейтинга (максимум 40 баллов)
+      const searchRating = typeof search.rating === 'number' ? search.rating : 0;
+      const matchRating = typeof match.rating === 'number' ? match.rating : 0;
+      const ratingDiff = Math.abs(searchRating - matchRating);
+      score += Math.max(0, 40 - ratingDiff * 2);
 
-    // Близость возраста (максимум 30 баллов)
-    const ageDiff = Math.abs(search.age - match.age);
-    score += Math.max(0, 30 - ageDiff * 2);
+      // Близость возраста (максимум 30 баллов)
+      const searchAge = typeof search.age === 'number' ? search.age : 25;
+      const matchAge = typeof match.age === 'number' ? match.age : 25;
+      const ageDiff = Math.abs(searchAge - matchAge);
+      score += Math.max(0, 30 - ageDiff * 2);
 
-    // Геолокация (максимум 30 баллов)
-    if (search.useGeolocation && match.useGeolocation && search.location && match.location) {
-      const distance = this.calculateDistance(
-        search.location.coordinates,
-        match.location.coordinates
-      );
-      score += Math.max(0, 30 - (distance / 1000)); // distance в км
+      // Геолокация (максимум 30 баллов)
+      if (search.useGeolocation && match.useGeolocation && 
+          search.location && match.location && 
+          search.location.coordinates && match.location.coordinates &&
+          search.location.coordinates.length >= 2 && match.location.coordinates.length >= 2) {
+        try {
+          const distance = this.calculateDistance(
+            search.location.coordinates as [number, number],
+            match.location.coordinates as [number, number]
+          );
+          score += Math.max(0, 30 - (distance / 1000)); // distance в км
+        } catch (error) {
+          // Ошибка при расчете расстояния - просто не добавляем эти баллы
+          wsLogger.warn('distance_calc', (error as Error).message, {
+            matchId: match._id?.toString()
+          });
+        }
+      }
+
+      return score;
+    } catch (error) {
+      wsLogger.warn('match_score', (error as Error).message, {
+        searchId: search._id?.toString(),
+        matchId: match._id?.toString()
+      });
+      // В случае ошибки возвращаем базовый счет
+      return 50; // базовый счет по умолчанию
     }
-
-    return score;
   }
 
   private static calculateDistance(coord1: [number, number], coord2: [number, number]): number {
-    // Реализация формулы гаверсинусов для расчета расстояния между точками
-    const R = 6371e3; // радиус Земли в метрах
-    const φ1 = (coord1[1] * Math.PI) / 180;
-    const φ2 = (coord2[1] * Math.PI) / 180;
-    const Δφ = ((coord2[1] - coord1[1]) * Math.PI) / 180;
-    const Δλ = ((coord2[0] - coord1[0]) * Math.PI) / 180;
+    try {
+      // Проверка на валидность координат
+      if (!coord1 || !coord2 || coord1.length < 2 || coord2.length < 2 ||
+          typeof coord1[0] !== 'number' || typeof coord1[1] !== 'number' ||
+          typeof coord2[0] !== 'number' || typeof coord2[1] !== 'number' ||
+          isNaN(coord1[0]) || isNaN(coord1[1]) || isNaN(coord2[0]) || isNaN(coord2[1])) {
+        throw new Error('Invalid coordinates for distance calculation');
+      }
 
-    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
-              Math.cos(φ1) * Math.cos(φ2) *
-              Math.sin(Δλ/2) * Math.sin(Δλ/2);
-    
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      // Реализация формулы гаверсинусов для расчета расстояния между точками
+      const R = 6371e3; // радиус Земли в метрах
+      const φ1 = (coord1[1] * Math.PI) / 180;
+      const φ2 = (coord2[1] * Math.PI) / 180;
+      const Δφ = ((coord2[1] - coord1[1]) * Math.PI) / 180;
+      const Δλ = ((coord2[0] - coord1[0]) * Math.PI) / 180;
 
-    return R * c; // расстояние в метрах
+      const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                Math.cos(φ1) * Math.cos(φ2) *
+                Math.sin(Δλ/2) * Math.sin(Δλ/2);
+      
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0, 1-a))); // Защита от отрицательных значений
+
+      return R * c; // расстояние в метрах
+    } catch (error) {
+      wsLogger.warn('distance_calculation', (error as Error).message, {
+        coord1: JSON.stringify(coord1),
+        coord2: JSON.stringify(coord2)
+      });
+      return 10000; // возвращаем 10км как безопасное значение по умолчанию
+    }
   }
 
   private static async createMatch(search1: ISearch & { _id: mongoose.Types.ObjectId }, search2: ISearch & { _id: mongoose.Types.ObjectId }) {
-    // Создаем анонимный чат
-    const chat = await Chat.create({
-      participants: [search1.userId, search2.userId],
-      type: 'anonymous'
-    });
+    try {
+      // Проверка данных перед созданием чата
+      if (!search1.userId || !search2.userId || !search1.telegramId || !search2.telegramId) {
+        throw new Error('Invalid search data for match creation');
+      }
 
-    // Обновляем статусы поиска
-    await Promise.all([
-      Search.findByIdAndUpdate(search1._id, {
-        status: 'matched',
-        matchedWith: {
-          userId: search2.userId,
+      // Создаем анонимный чат
+      const chat = await Chat.create({
+        // Участники как массив ObjectId
+        participants: [
+          search1.userId,
+          search2.userId
+        ],
+        messages: [],
+        // Добавляем тип чата (обязательное поле)
+        type: 'anonymous',
+        isActive: true,
+        startedAt: new Date()
+      });
+
+      // Проверяем, что чат был успешно создан и имеет _id
+      if (!chat || !chat._id) {
+        throw new Error('Failed to create chat for match');
+      }
+
+      wsLogger.info('match_created', 'Создан новый матч', {
+        chatId: chat._id.toString(),
+        search1Id: search1._id.toString(),
+        search2Id: search2._id.toString(),
+      });
+
+      // Обновляем статус обоих поисков
+      await Promise.all([
+        Search.findByIdAndUpdate(search1._id, {
+          status: 'matched',
+          matchedWith: {
+            userId: search2.userId,
+            telegramId: search2.telegramId,
+            chatId: chat._id
+          }
+        }),
+        Search.findByIdAndUpdate(search2._id, {
+          status: 'matched',
+          matchedWith: {
+            userId: search1.userId,
+            telegramId: search1.telegramId,
+            chatId: chat._id
+          }
+        })
+      ]);
+
+      // Отправляем уведомления обоим пользователям
+      wsManager.sendToUser(search1.userId.toString(), 'search:matched', {
+        matchedUser: {
           telegramId: search2.telegramId,
-          chatId: chat._id
+          gender: search2.gender,
+          age: search2.age,
+          chatId: chat._id.toString()
         }
-      }),
-      Search.findByIdAndUpdate(search2._id, {
-        status: 'matched',
-        matchedWith: {
-          userId: search1.userId,
+      });
+
+      wsManager.sendToUser(search2.userId.toString(), 'search:matched', {
+        matchedUser: {
           telegramId: search1.telegramId,
-          chatId: chat._id
+          gender: search1.gender,
+          age: search1.age,
+          chatId: chat._id.toString()
         }
-      })
-    ]);
+      });
 
-    // Уведомляем обоих пользователей о мэтче
-    wsManager.sendToUser(search1.userId.toString(), 'search:matched', {
-      matchedUser: {
-        telegramId: search2.telegramId,
-        chatId: chat._id.toString()
+      // Атомарно обновляем статистику после мэтча
+      await this.updateAndBroadcastStats('match', search1.userId.toString());
+
+      return chat;
+    } catch (error) {
+      wsLogger.warn('create_match', (error as Error).message, {
+        search1Id: search1._id.toString(),
+        search2Id: search2._id.toString(),
+        stack: (error as Error).stack
+      });
+      
+      // Попытка отката, если произошла ошибка после создания чата
+      try {
+        // Обновляем статусы обратно на searching
+        await Promise.all([
+          Search.findByIdAndUpdate(search1._id, { status: 'searching', $unset: { matchedWith: 1 } }),
+          Search.findByIdAndUpdate(search2._id, { status: 'searching', $unset: { matchedWith: 1 } })
+        ]);
+      } catch (rollbackError) {
+        wsLogger.warn('match_rollback', (rollbackError as Error).message, {
+          search1Id: search1._id.toString(),
+          search2Id: search2._id.toString()
+        });
       }
-    });
-
-    wsManager.sendToUser(search2.userId.toString(), 'search:matched', {
-      matchedUser: {
-        telegramId: search1.telegramId,
-        chatId: chat._id.toString()
-      }
-    });
-
-    // Отправляем обновленную статистику всем после матча
-    // Используем новый метод для обновления статистики с учетом среднего времени
-    await this.updateAndBroadcastStats('match', search1.userId.toString());
-
-    return chat;
+      
+      throw error; // Пробрасываем ошибку дальше для правильной обработки
+    }
   }
 
   static async getSearchStats() {
-    // Уменьшаем логирование
-    // wsLogger.info('stats_request', 'Запрос статистики');
-
-    // Используем кэш если он свежий
+    // Проверяем кэш
     if (this.statsCache && Date.now() - this.statsCache.timestamp < this.CACHE_TTL) {
-      // Уменьшаем логирование
-      // wsLogger.info('stats_cache_hit', 'Возврат статистики из кэша', {
-      //   cacheAge: Date.now() - this.statsCache.timestamp
-      // });
       return this.statsCache.data;
     }
 
-    // Уменьшаем логирование
-    // wsLogger.info('stats_cache_miss', 'Получение свежей статистики');
-    
-    // Получаем статистику поиска
-    const [searchingStats, onlineStats, avgSearchTimeStats] = await Promise.all([
-      // Статистика поиска
-      Search.aggregate([
-        { $match: { status: 'searching' } },
-        {
-          $group: {
-            _id: '$gender',
-            count: { $sum: 1 }
-          }
-        }
-      ]),
-      // Статистика онлайн пользователей
-      User.aggregate([
-        { 
-          $match: { 
-            isActive: true,
-            lastActive: { 
-              $gte: new Date(Date.now() - 30 * 1000) // активны за последние 30 секунд
-            }
-          }
-        },
-        {
-          $group: {
-            _id: '$gender',
-            count: { $sum: 1 }
-          }
-        }
-      ]),
-      // Статистика по времени поиска (для мэтчей за последние 24 часа)
-      Search.aggregate([
-        { 
-          $match: { 
-            status: 'matched',
-            updatedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } // за последние 24 часа
-          } 
-        },
-        {
-          $project: {
-            searchDuration: { 
-              $subtract: ['$updatedAt', '$createdAt'] // разница в миллисекундах
-            },
-            gender: 1
-          }
-        },
-        {
-          $group: {
-            _id: '$gender',
-            avgTime: { $avg: '$searchDuration' }, // среднее время в мс
-            count: { $sum: 1 }
-          }
-        }
-      ])
+    // Получаем количество пользователей в поиске
+    const [totalSearching, maleSearching, femaleSearching] = await Promise.all([
+      Search.countDocuments({ status: 'searching' }),
+      Search.countDocuments({ status: 'searching', gender: 'male' }),
+      Search.countDocuments({ status: 'searching', gender: 'female' })
     ]);
 
-    // Расчет общего среднего времени поиска
-    let totalSearchTime = 0;
-    let totalSearchCount = 0;
-    
-    avgSearchTimeStats.forEach(stat => {
-      totalSearchTime += (stat.avgTime || 0) * stat.count;
-      totalSearchCount += stat.count;
+    // Получаем количество онлайн пользователей и суммируем из разных источников
+    const [onlineUsers, totalOnlineFromDB] = await Promise.all([
+      User.find({ isActive: true }).select('gender'),
+      User.countDocuments({ isActive: true })
+    ]);
+
+    // Подсчитываем количество мужчин и женщин онлайн
+    let maleOnline = 0;
+    let femaleOnline = 0;
+    onlineUsers.forEach(user => {
+      if (user.gender === 'male') maleOnline++;
+      else if (user.gender === 'female') femaleOnline++;
     });
-    
-    const avgSearchTimeTotal = totalSearchCount > 0 ? 
-      Math.round(totalSearchTime / totalSearchCount / 1000) : 0; // в секундах
-    
+
+    // Получаем статистику по времени поиска и мэтчам за 24 часа
+    const oneDayAgo = new Date();
+    oneDayAgo.setDate(oneDayAgo.getDate() - 1);
+
+    const matches24h = await Search.countDocuments({
+      status: 'matched',
+      updatedAt: { $gte: oneDayAgo }
+    });
+
+    // Собираем и возвращаем статистику
     const stats = {
-      // Статистика поиска
-      t: searchingStats.reduce((sum, stat) => sum + stat.count, 0),
-      m: searchingStats.find(s => s._id === 'male')?.count || 0,
-      f: searchingStats.find(s => s._id === 'female')?.count || 0,
-      // Статистика онлайн
+      t: totalSearching,
+      m: maleSearching,
+      f: femaleSearching,
       online: {
-        t: onlineStats.reduce((sum, stat) => sum + stat.count, 0),
-        m: onlineStats.find(s => s._id === 'male')?.count || 0,
-        f: onlineStats.find(s => s._id === 'female')?.count || 0
+        t: totalOnlineFromDB,
+        m: maleOnline,
+        f: femaleOnline
       },
-      // Статистика по времени поиска (в секундах)
       avgSearchTime: {
-        t: avgSearchTimeTotal,
-        m: Math.round((avgSearchTimeStats.find(s => s._id === 'male')?.avgTime || 0) / 1000),
-        f: Math.round((avgSearchTimeStats.find(s => s._id === 'female')?.avgTime || 0) / 1000),
-        // Дополнительно - количество успешных мэтчей за 24 часа
-        matches24h: totalSearchCount
+        t: 0, // Эти значения могут быть заполнены реальными данными позже
+        m: 0,
+        f: 0,
+        matches24h
       }
     };
-    
+
     // Обновляем кэш
     this.statsCache = {
       data: stats,
       timestamp: Date.now()
     };
 
-    // wsLogger.info('stats_updated', 'Статистика обновлена', stats);
     return stats;
   }
 
-  /**
-   * Получает активный поиск пользователя по его ID
-   * @param userId ID пользователя
-   * @returns Объект поиска или null, если пользователь не в поиске
-   */
   static async getUserActiveSearch(userId: string) {
     return await Search.findOne({
-      userId: new mongoose.Types.ObjectId(userId),
+      userId,
       status: 'searching'
     });
   }
 
   public static async broadcastSearchStats() {
-    if (this.debounceTimeout) {
-      clearTimeout(this.debounceTimeout);
-      // wsLogger.info('stats_debounce', 'Сброс таймера дебаунса');
-    }
-    
-    this.debounceTimeout = setTimeout(async () => {
-      // wsLogger.info('stats_broadcast_start', 'Начало рассылки статистики');
+    try {
       const stats = await this.getSearchStats();
       wsManager.io.to('search_stats_room').emit('search:stats', stats);
-      // wsLogger.info('stats_broadcast_complete', 'Статистика разослана', {
-      //   subscribersCount: wsManager.io.sockets.adapter.rooms.get('search_stats_room')?.size || 0
-      // });
-    }, this.DEBOUNCE_DELAY);
+      return stats; // Возвращаем stats для соответствия предыдущему Promise<any>
+    } catch (error) {
+      console.error('Failed to broadcast search stats:', error);
+      return null; // Возвращаем null в случае ошибки
+    }
   }
 
-  /**
-   * Атомарное обновление и отправка статистики всем подписчикам
-   * @param action Тип действия ('start', 'cancel', 'match')
-   * @param userId ID пользователя, выполнившего действие
-   */
   private static async updateAndBroadcastStats(action: 'start' | 'cancel' | 'match', userId: string) {
-    // Используем семафор для предотвращения одновременного доступа к статистике
-    if (this.updatingStats) {
-      wsLogger.info('stats_update_queued', `Запрос на обновление статистики (${action}) поставлен в очередь`, {
-        userId,
-        action
-      });
-      // Если обновление уже идет, просто запланируем broadcastSearchStats
-      this.pendingUpdates = true;
-      return;
-    }
-
+    // Вынесли обновление статистики в отдельный метод для атомарности
     try {
+      // Если статистика уже обновляется, планируем еще одно обновление после завершения текущего
+      if (this.updatingStats) {
+        this.pendingUpdates = true;
+        return;
+      }
+
       this.updatingStats = true;
-      
-      let stats;
-      
-      // Пробуем обновить кэш инкрементно вместо полного сброса
+
+      // Если у нас есть кэш и он свежий, то обновим его инкрементально
       if (this.statsCache && Date.now() - this.statsCache.timestamp < this.CACHE_TTL) {
-        // Если есть свежий кэш и действие предсказуемо, обновляем инкрементно
-        const userSearch = action === 'start' ? 
-          await this.getUserActiveSearch(userId) : null;
-          
-        if (action === 'start' && userSearch) {
-          // Инкрементно обновляем кэш при начале поиска
-          const gender = userSearch.gender as 'male' | 'female';
-          if (gender === 'male' || gender === 'female') {
-            this.statsCache.data.t += 1;
-            this.statsCache.data[gender.charAt(0)] += 1;
-            stats = { ...this.statsCache.data }; // создаем копию данных
-            wsLogger.info('stats_incremental_update', 'Инкрементное обновление кэша (начало поиска)', { 
-              gender, 
-              userId 
-            });
-          } else {
-            // Если пол неизвестен, делаем полное обновление
-            this.statsCache = null;
-            stats = await this.getSearchStats();
-          }
-        } else if (action === 'cancel') {
-          // Декрементно обновляем кэш при отмене поиска, но только если точно знаем пол
-          const canceledSearch = await Search.findOne({
-            userId: new mongoose.Types.ObjectId(userId),
-            status: 'cancelled'
+        // Получаем пол пользователя для инкрементного обновления статистики
+        const user = await Search.findOne({ userId });
+        const gender = user?.gender;
+
+        if (gender) {
+          // Логируем, что выполняем инкрементное обновление
+          wsLogger.info('stats_incremental_update', 'Инкрементное обновление кэша (' + action + ' поиска)', {
+            gender,
+            userId
           });
-          
-          if (canceledSearch && (canceledSearch.gender === 'male' || canceledSearch.gender === 'female')) {
-            const gender = canceledSearch.gender as 'male' | 'female';
-            // Уменьшаем только количество ищущих, не трогая онлайн
+
+          // Инкрементально обновляем статистику в зависимости от действия
+          if (action === 'start') {
+            this.statsCache.data.t++;
+            if (gender === 'male') this.statsCache.data.m++;
+            else if (gender === 'female') this.statsCache.data.f++;
+          } else if (action === 'cancel') {
             this.statsCache.data.t = Math.max(0, this.statsCache.data.t - 1);
-            this.statsCache.data[gender.charAt(0)] = Math.max(0, this.statsCache.data[gender.charAt(0)] - 1);
+            if (gender === 'male') this.statsCache.data.m = Math.max(0, this.statsCache.data.m - 1);
+            else if (gender === 'female') this.statsCache.data.f = Math.max(0, this.statsCache.data.f - 1);
+          } else if (action === 'match') {
+            // При мэтче двое покидают поиск
+            this.statsCache.data.t = Math.max(0, this.statsCache.data.t - 2);
             
-            // Убеждаемся что статистика онлайн сохраняется
-            const currentStats = { ...this.statsCache.data }; // создаем копию данных
+            // Увеличиваем счетчик мэтчей
+            this.statsCache.data.avgSearchTime.matches24h++;
             
-            // Если по какой-то причине кэш не содержит данных об онлайн, запрашиваем свежие данные
-            if (!currentStats.online) {
-              const freshStats = await this.getSearchStats();
-              // Обновляем только данные о поиске, сохраняя актуальную информацию онлайн
-              this.statsCache = {
-                data: {
-                  ...freshStats,
-                  t: currentStats.t,
-                  m: currentStats.m,
-                  f: currentStats.f
-                },
-                timestamp: Date.now()
-              };
-              stats = this.statsCache.data;
-            } else {
-              stats = currentStats;
-            }
-            
-            wsLogger.info('stats_incremental_update', 'Инкрементное обновление кэша (отмена поиска)', { 
-              gender, 
-              userId 
-            });
-          } else {
-            // Если не нашли отмененный поиск, делаем полное обновление
-            this.statsCache = null;
-            stats = await this.getSearchStats();
+            // Мы не знаем пол второго участника, поэтому просто сокращаем общее количество
+            // и корректируем пол известного нам участника
+            if (gender === 'male') this.statsCache.data.m = Math.max(0, this.statsCache.data.m - 1);
+            else if (gender === 'female') this.statsCache.data.f = Math.max(0, this.statsCache.data.f - 1);
           }
-        } else if (action === 'match') {
-          // При матче мы не меняем текущую статистику поиска, но можем обновить
-          // статистику среднего времени поиска. Для простоты делаем полное обновление
-          // при матчах, так как это редкое событие и требуется точность.
-          this.statsCache = null;
-          stats = await this.getSearchStats();
-        } else {
-          // Для других действий или при сложных сценариях делаем полное обновление
-          this.statsCache = null;
-          stats = await this.getSearchStats();
+
+          // Обновляем временную метку кэша
+          this.statsCache.timestamp = Date.now();
         }
       } else {
-        // Если кэш устарел или отсутствует, получаем свежую статистику
-        this.statsCache = null;
-        stats = await this.getSearchStats();
+        // Если кэша нет или он устарел, запрашиваем полные данные
+        await this.getSearchStats();
       }
-      
-      // Отправляем статистику всем подписчикам сразу
-      wsManager.io.to('search_stats_room').emit('search:stats', stats);
-      
-      wsLogger.info('stats_force_update', `Статистика отправлена после действия: ${action}`, {
+
+      // Отправляем обновленную статистику всем подписчикам
+      wsLogger.info('stats_force_update', 'Статистика отправлена после действия: ' + action, {
         userId,
-        stats,
+        stats: this.statsCache?.data,
         fromCache: !!this.statsCache
       });
-      
-    } catch (error) {
-      wsLogger.error('stats_update_error', userId, error as Error, {
-        action
-      });
-    } finally {
-      // Снимаем блокировку
+      await this.broadcastSearchStats();
+
       this.updatingStats = false;
-      
-      // Если были запросы на обновление во время выполнения, запускаем стандартный механизм
+
+      // Если были отложенные обновления, выполняем еще одно
       if (this.pendingUpdates) {
         this.pendingUpdates = false;
-        await this.broadcastSearchStats();
+        // Используем setTimeout, чтобы избежать слишком глубокой рекурсии
+        setTimeout(() => this.broadcastSearchStats(), 0);
       }
+    } catch (error) {
+      this.updatingStats = false;
+      console.error('Failed to update and broadcast stats:', error);
+      throw error;
     }
   }
-  
-  // Флаги для контроля конкурентных обновлений
+
   private static updatingStats = false;
   private static pendingUpdates = false;
 } 

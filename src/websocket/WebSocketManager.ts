@@ -308,6 +308,11 @@ export class WebSocketManager {
           User.findByIdAndUpdate(userId, {
             isActive: false,
             lastActive: new Date()
+          }).then(() => {
+            // Обновляем статистику после изменения статуса
+            SearchService.broadcastSearchStats().catch((error: unknown) => {
+              wsLogger.error('update_stats_on_disconnect', userId, error as Error);
+            });
           }).catch((error: unknown) => {
             wsLogger.error('update_activity', userId, error as Error);
           });
