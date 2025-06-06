@@ -13,6 +13,7 @@ import { router as userRouter } from './routes/userRoutes';
 import { router as chatRouter } from './routes/chatRoutes';
 import { router as authRouter } from './routes/authRoutes';
 import { router as searchRouter } from './routes/searchRoutes';
+import monetizationRouter from './routes/monetizationRoutes';
 import { monitoringRouter } from './routes/monitoringRoutes';
 import { authMiddleware } from './middleware/authMiddleware';
 import mongoose from 'mongoose';
@@ -69,6 +70,7 @@ app.get('/health', (_req, res) => {
 app.use('/api/users', authMiddleware, userRouter);
 app.use('/api/chats', authMiddleware, chatRouter);
 app.use('/api/search', searchRouter);
+app.use('/api/monetization', authMiddleware, monetizationRouter);
 
 // Error handling middleware
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

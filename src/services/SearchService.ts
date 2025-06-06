@@ -4,6 +4,7 @@ import { wsManager } from '../server';
 import mongoose from 'mongoose';
 import { wsLogger } from '../utils/logger';
 import User from '../models/User';
+import { MonetizationService } from './MonetizationService';
 
 export interface SearchCriteria {
   gender: 'male' | 'female';
@@ -44,6 +45,14 @@ export class SearchService {
     telegramId: string,
     criteria: SearchCriteria
   ): Promise<SearchResult> {
+    // === ПРОВЕРКА МОНЕТИЗАЦИИ ===
+    const canSearch = await MonetizationService.canUserSearch(userId);
+    if (!canSearch.canSearch) {
+      throw new Error(canSearch.reason || 'Поиск недоступен');
+    }
+
+    // НЕ списываем попытку здесь - только при успешном матче
+
     // Добавляем логирование полученных критериев
     wsLogger.info('search_service_start', 'Запуск поиска в сервисе', {
       userId,
@@ -383,6 +392,12 @@ export class SearchService {
             chatId: chat._id
           }
         })
+      ]);
+
+      // === СПИСЫВАЕМ ПОПЫТКИ ПОИСКА ТОЛЬКО ПРИ УСПЕШНОМ МАТЧЕ ===
+      await Promise.all([
+        MonetizationService.useSearchAttempt(search1.userId.toString()),
+        MonetizationService.useSearchAttempt(search2.userId.toString())
       ]);
 
       // Отправляем уведомления обоим пользователям

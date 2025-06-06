@@ -8,6 +8,7 @@ import { wsLogger } from '../utils/logger';
 import { metricsCollector } from '../utils/metrics';
 import { CircuitBreaker } from '../utils/CircuitBreaker';
 import User from '../models/User';
+import { RatingService } from '../services/RatingService';
 
 // Создаем статическую карту для хранения таймаутов
 const pendingSearchCancellations = new Map<string, NodeJS.Timeout>();
@@ -244,6 +245,55 @@ export class WebSocketManager {
         this.handleChatRead(socket, data).catch(error => {
           wsLogger.error(userId, socket.id, error as Error, { event: 'chat_read', chatId: data.chatId });
         });
+      });
+
+      // Новый обработчик завершения чата
+      socket.on('chat:end', async (data) => {
+        const startTime = Date.now();
+        wsLogger.event('chat_end', userId, socket.id, { 
+          chatId: data.chatId,
+          reason: data.reason 
+        });
+
+        try {
+          await ChatService.endChat(data.chatId, userId, data.reason);
+          const duration = Date.now() - startTime;
+          metricsCollector.messageProcessed(duration);
+        } catch (error) {
+          metricsCollector.errorOccurred(error as Error);
+          wsLogger.error(userId, socket.id, error as Error, { 
+            event: 'chat_end', 
+            chatId: data.chatId 
+          });
+          socket.emit('error', { message: 'Failed to end chat' });
+        }
+      });
+
+      // Новый обработчик оценки чата
+      socket.on('chat:rate', async (data) => {
+        const startTime = Date.now();
+        wsLogger.event('chat_rate', userId, socket.id, { 
+          chatId: data.chatId,
+          score: data.score 
+        });
+
+        try {
+          await RatingService.rateUser(
+            data.chatId,
+            userId,
+            data.score,
+            data.comment
+          );
+          const duration = Date.now() - startTime;
+          metricsCollector.messageProcessed(duration);
+        } catch (error) {
+          metricsCollector.errorOccurred(error as Error);
+          wsLogger.error(userId, socket.id, error as Error, { 
+            event: 'chat_rate', 
+            chatId: data.chatId 
+          });
+          socket.emit('error', { message: 'Failed to rate chat' });
+        }
       });
 
       // Обработчики контактов

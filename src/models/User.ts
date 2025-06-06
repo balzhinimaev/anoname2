@@ -49,6 +49,59 @@ export interface IUser extends Document {
   createdAt: Date;
   /** Дата последнего обновления профиля */
   updatedAt: Date;
+  
+  // === МОНЕТИЗАЦИЯ ===
+  /** Премиум статус пользователя */
+  subscription?: {
+    /** Тип подписки */
+    type: 'basic' | 'premium' | 'gold';
+    /** Дата начала подписки */
+    startDate: Date;
+    /** Дата окончания подписки */
+    endDate: Date;
+    /** Активна ли подписка */
+    isActive: boolean;
+    /** Автопродление */
+    autoRenew: boolean;
+  };
+  
+  /** Виртуальная валюта пользователя */
+  currency?: {
+    /** Количество "сердечек" */
+    hearts: number;
+    /** Количество "буостов" */
+    boosts: number;
+    /** Количество "супер-лайков" */
+    superLikes: number;
+    /** Последнее пополнение бесплатной валюты */
+    lastFreeRefill: Date;
+  };
+  
+  /** Лимиты использования для базовых пользователей */
+  limits?: {
+    /** Количество поисков сегодня */
+    searchesToday: number;
+    /** Дата последнего сброса лимитов */
+    lastReset: Date;
+    /** Максимальное расстояние поиска (км) */
+    maxSearchDistance: number;
+    /** Можно ли использовать расширенные фильтры */
+    canUseAdvancedFilters: boolean;
+  };
+  
+  /** Статистика для аналитики */
+  analytics?: {
+    /** Общее количество матчей */
+    totalMatches: number;
+    /** Количество успешных разговоров */
+    successfulChats: number;
+    /** Средняя оценка от других пользователей */
+    averageRating: number;
+    /** Количество полученных оценок */
+    ratingsCount: number;
+    /** Популярность профиля (просмотры) */
+    profileViews: number;
+  };
 }
 
 /**
@@ -73,7 +126,42 @@ const UserSchema: Schema = new Schema({
   age: { type: Number, min: 18 },
   photos: [{ type: String }],
   isActive: { type: Boolean, default: true },
-  lastActive: { type: Date, default: Date.now }
+  lastActive: { type: Date, default: Date.now },
+  
+  // === ПОЛЯ МОНЕТИЗАЦИИ ===
+  subscription: {
+    type: {
+      type: String,
+      enum: ['basic', 'premium', 'gold'],
+      default: 'basic'
+    },
+    startDate: { type: Date },
+    endDate: { type: Date },
+    isActive: { type: Boolean, default: false },
+    autoRenew: { type: Boolean, default: false }
+  },
+  
+  currency: {
+    hearts: { type: Number, default: 10 }, // Бесплатно 10 в день
+    boosts: { type: Number, default: 0 },
+    superLikes: { type: Number, default: 1 }, // 1 бесплатный супер-лайк
+    lastFreeRefill: { type: Date, default: Date.now }
+  },
+  
+  limits: {
+    searchesToday: { type: Number, default: 0 },
+    lastReset: { type: Date, default: Date.now },
+    maxSearchDistance: { type: Number, default: 10 }, // 10км для базовых
+    canUseAdvancedFilters: { type: Boolean, default: false }
+  },
+  
+  analytics: {
+    totalMatches: { type: Number, default: 0 },
+    successfulChats: { type: Number, default: 0 },
+    averageRating: { type: Number, default: 0 },
+    ratingsCount: { type: Number, default: 0 },
+    profileViews: { type: Number, default: 0 }
+  }
 }, {
   timestamps: true
 });

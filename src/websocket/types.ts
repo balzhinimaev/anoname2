@@ -43,6 +43,16 @@ export interface ServerToClientEvents {
     userId: string;
     timestamp: Date;
   }) => void;
+  'chat:ended': (data: {
+    chatId: string;
+    endedBy: string;
+    reason?: string;
+  }) => void;
+  'chat:rated': (data: {
+    chatId: string;
+    ratedBy: string;
+    score: number;
+  }) => void;
 
   // Контакты
   'contact:request': (data: {
@@ -92,6 +102,15 @@ export interface ClientToServerEvents {
   'chat:read': (data: {
     chatId: string;
     timestamp: Date;
+  }) => void;
+  'chat:end': (data: {
+    chatId: string;
+    reason?: string;
+  }) => void;
+  'chat:rate': (data: {
+    chatId: string;
+    score: number;
+    comment?: string;
   }) => void;
 
   // Контакты

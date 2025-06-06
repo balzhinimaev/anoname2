@@ -1,6 +1,7 @@
 import Chat from '../models/Chat';
 import { wsManager } from '../server';
 import mongoose from 'mongoose';
+import { wsLogger } from '../utils/logger';
 
 export class ChatService {
   static async sendMessage(chatId: string, userId: string, content: string) {
@@ -54,6 +55,40 @@ export class ChatService {
       chatId,
       userId,
       timestamp
+    });
+  }
+
+  static async endChat(chatId: string, userId: string, reason?: string): Promise<void> {
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+      throw new Error('Chat not found');
+    }
+
+    if (!chat.participants.some(p => p.toString() === userId)) {
+      throw new Error('User is not a participant of this chat');
+    }
+
+    // Проверяем, не завершен ли уже чат
+    if (!chat.isActive) {
+      throw new Error('Chat is already ended');
+    }
+
+    // Обновляем статус чата
+    chat.isActive = false;
+    chat.endedAt = new Date();
+    chat.endedBy = new mongoose.Types.ObjectId(userId);
+    chat.endReason = reason;
+    await chat.save();
+
+    // Уведомляем всех участников о завершении чата
+    wsManager.io.to(`chat:${chatId}`).emit('chat:ended', {
+      chatId,
+      endedBy: userId,
+      reason
+    });
+
+    wsLogger.info('chat_ended', `Chat ${chatId} ended by user ${userId}`, {
+      reason
     });
   }
 } 

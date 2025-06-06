@@ -41,6 +41,12 @@ export interface IChat {
   createdAt: Date;
   /** Время последнего обновления чата */
   updatedAt: Date;
+  /** Время завершения чата */
+  endedAt?: Date;
+  /** Пользователь, завершивший чат */
+  endedBy?: mongoose.Types.ObjectId;
+  /** Причина завершения чата */
+  endReason?: string;
 }
 
 /**
@@ -90,6 +96,16 @@ const chatSchema = new mongoose.Schema<IChat>({
   },
   expiresAt: {
     type: Date
+  },
+  endedAt: {
+    type: Date
+  },
+  endedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  endReason: {
+    type: String
   }
 }, {
   timestamps: true
